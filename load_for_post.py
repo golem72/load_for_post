@@ -10,7 +10,7 @@ load_for_post.py — выгрузка утверждённых документ�
        со штампом об электронной подписи; GetPdf — черновой вариант без штампа)
 
 Использование:
-    python3 load_for_post.py [ДД.ММ.ГГГГ] [--post-only | --no-post]
+    python3 load_for_post.py [ДД.ММ.ГГГГ]
 (без аргумента — сегодняшняя дата)
 
 Стадия 1 — выгрузка утверждённых PDF (Извещение/Протокол/Определение/Постановление)
@@ -18,10 +18,13 @@ load_for_post.py — выгрузка утверждённых документ�
 Стадия 2 — почта РФ: получатель определяется из текста каждого PDF (ФИО/название,
           ИНН, адрес); документы разных типов на одного получателя (ключ — ИНН,
           резерво — нормализованное ФИО/название) сливаются в один PDF;
-          заполняется реестр registry.xlsx (по шаблону registry-template.xlsx,
-          тип письма = 1, КПП и доп. услуга ЮЗЭУВ не заполняются);
+          заполняется реестр registry.xlsx (формат — см. registry.md; в первой строке —
+          имена полей; заполняются: FILE_NAME, ADDRESSLINE_TO (без индекса),
+          RECIPIENT_TYPE, RECIPIENT, LETTER_REG_NUMBER (нумерация с 1), MAILCATEGORY=1,
+          ADDRESSLINE_RETURN, INN, LETTER_TITLE (перечисление типов документов),
+          WOMAILRANK=0, NO_RETURN=1; SNILS/KPP/доп. поля не заполняются);
           итоговые архивы out/<ДД.ММ.ГГГГ>/post.zip = сжатые PDF + registry.xlsx.
-          Лимит: не более ZIP_MAX_DOCS (50) писем в одном архиве; при превышении
+          Лимит: не более ZIP_MAX_DOCS (1000) писем в одном архиве; при превышении
           архивы разбиваются: post1.zip, post2.zip, ... — каждый со своим
           registry.xlsx (только свои получатели).
           Для стадии 2 нужны пакеты: pypdf, pdfplumber, openpyxl.
@@ -46,7 +49,7 @@ OUT_ROOT = os.path.join(BASE_DIR, "out")
 HOST = "https://lks.dap.gov.ru"
 AUTH_URL = HOST + "/internal/auth/authenticator/api/internalauth/auth?loaderKey=default"
 LIST_URL = HOST + "/public/rosstat/ouzd/web_api/api/ApprovalDocument/List"
-ZIP_MAX_DOCS = 50  # максимум писем (получателей) в одном post*.zip
+ZIP_MAX_DOCS = 1000  # максимум писем (получателей) в одном post*.zip
 PDF_URL = HOST + "/public/rosstat/ouzd/web_api/api/ApprovalDocument/GetFinalPdf?id={id}"
 XML_URL = HOST + "/public/rosstat/ouzd/web_api/api/ApprovalDocument/GetXml?id={id}"
 LOGIN_PAGE = HOST + "/internal/authutil/auth/login"
@@ -728,62 +731,83 @@ def parse_xml_recipient(xml_path):
     return res
 
 
-def build_registry_xlsx(template, rpath, subset, sender_address):
-    """Заполняет один реестр (шаблон -> rpath) по списку групп subset."""
+# --- Формат реестра registry.xlsx: описание полей — в registry.md;
+#     первая строка — ИМЕНА ПОЛЕЙ, далее — данные.
+REGISTRY_FIELDS = [
+    "FILE_NAME", "ADDRESSLINE_TO", "RECIPIENT_TYPE", "RECIPIENT",
+    "LETTER_REG_NUMBER", "MAILCATEGORY", "ADDRESSLINE_RETURN", "SNILS",
+    "INN", "KPP", "LETTER_TITLE", "WOMAILRANK", "ADDITIONAL_INFO",
+    "LETTER_COMMENT", "NOTIFICATIONTYPE", "SENDERCOMMENT", "NO_RETURN",
+    "M4D_REFERENCE", "M4D_INFO",
+]
+
+
+def _strip_index(addr):
+    """По спецификации индекс в адресе не указывают — система подбирает сама."""
+    if not addr:
+        return ""
+    return re.sub(r"^\d{6}\s*,?\s*", "", addr.strip()).strip(", ") or addr
+
+
+def build_registry_xlsx(rpath, subset, sender_address):
+    """Собирает один реестр (rpath): 1-я строка — имена полей, далее — данные."""
     import openpyxl
-    shutil.copyfile(template, rpath)
-    wb = openpyxl.load_workbook(rpath)
-    ws = None
-    for sn in wb.sheetnames:
-        if "реестр" in sn.lower():
-            ws = wb[sn]
-            break
-    if ws is None:
-        ws = wb[wb.sheetnames[0]]
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Реестр"
+    for c, f in enumerate(REGISTRY_FIELDS, 1):
+        ws.cell(row=1, column=c, value=f)
     row = 2
-    for g in subset:
-        ws.cell(row=row, column=1, value=g["zipname"])
-        ws.cell(row=row, column=2, value=1)   # тип письма: заказное
-        ws.cell(row=row, column=3, value=1 if g["kind"] == "yur" else 0)
-        if g["kind"] == "yur" and g["best_org"]:
-            ws.cell(row=row, column=4, value=g["best_org"])
-        if g["inn"]:
-            ws.cell(row=row, column=5,
-                    value=int(g["inn"]) if g["inn"].isdigit() else g["inn"])
-        # столбец F (КПП) — по требованию не заполняется
-        if g["kind"] != "yur" and g["best_name"]:
-            tok = g["best_name"].split()
-            if len(tok) >= 3:
-                fam, im, otc = tok[0], tok[1], " ".join(tok[2:])
-            elif len(tok) == 2:
-                fam, im, otc = tok[0], tok[1], ""
-            else:
-                fam, im, otc = tok[0], "", ""
-            ws.cell(row=row, column=7, value=fam)
-            if im:
-                ws.cell(row=row, column=8, value=im)
-            if otc:
-                ws.cell(row=row, column=9, value=otc)
-        if g["best_addr"]:
-            ws.cell(row=row, column=10, value=g["best_addr"])
-        if sender_address:
-            ws.cell(row=row, column=11, value=sender_address)
-        # столбец L (доп. услуга ЮЗЭУВ) — по требованию не заполняется
+    for i, g in enumerate(subset, 1):
+        is_yur = g["kind"] == "yur"
+        recipient = (g["best_org"] if is_yur else g["best_name"]) or ""
+        # ИНН храним строкой: у физ.лиц ИНН может начинаться с нуля (int() бы его утратил)
+        inn_val = g["inn"] or None
+        letter_title = ", ".join(dict.fromkeys(x["type"] for x in g["docs"]))
+        vals = [
+            g["zipname"],                                    # FILE_NAME (<=50 зн.)
+            _strip_index(g["best_addr"]),                    # ADDRESSLINE_TO
+            1 if is_yur else 0,                               # RECIPIENT_TYPE
+            recipient[:147],                                  # RECIPIENT (<=147 зн.)
+            i,                                                # LETTER_REG_NUMBER (с 1, по порядку)
+            1,                                                # MAILCATEGORY
+            sender_address,                                   # ADDRESSLINE_RETURN
+            None,                                             # SNILS — не заполнять
+            inn_val,                                          # INN
+            None,                                             # KPP — не заполнять
+            letter_title,                                     # LETTER_TITLE
+            0,                                                # WOMAILRANK
+            None,                                             # ADDITIONAL_INFO — не заполнять
+            None,                                             # LETTER_COMMENT — не заполнять
+            None,                                             # NOTIFICATIONTYPE — не заполнять
+            None,                                             # SENDERCOMMENT — не заполнять
+            1,                                                # NO_RETURN
+            None,                                             # M4D_REFERENCE — не заполнять
+            None,                                             # M4D_INFO — не заполнять
+        ]
+        for c, v in enumerate(vals, 1):
+            ws.cell(row=row, column=c, value=v)
         row += 1
     wb.save(rpath)
     return row - 2
 
 
 def make_post_zips(date_dir, groups, cfg):
-    """Собирает post.zip (<=50 писем) или post1.zip/post2.zip/... при >50.
+    """Собирает post.zip (<=ZIP_MAX_DOCS писем) или post1.zip/post2.zip/... при превышении.
 
     Каждый архив: registry.xlsx (только его получатели) + сжатые PDF.
     Возвращает список путей архивов.
     """
-    template = os.path.join(BASE_DIR, "registry-template.xlsx")
-    if not os.path.exists(template):
-        print("ОШИБКА: не найден шаблон реестра: %s" % template)
-        return []
+    # Удаляем старые архивы/реестры прошлых прогонов в том же каталоге,
+    # чтобы в каталоге даты не смешивались несколько поколений пакетов.
+    for e in os.listdir(date_dir):
+        if re.match(r"^post\d?\.zip$", e) or re.match(r"^registry\d?\.xlsx$", e):
+            full = os.path.join(date_dir, e)
+            if os.path.isfile(full):
+                try:
+                    os.remove(full)
+                except OSError:
+                    pass
     sender_address = (cfg.get("sender_address") or "").strip()
     if not sender_address:
         sender_address = "241030, БРЯНСКАЯ обл., г. БРЯНСК, ул. КРАСНОАРМЕЙСКАЯ, д. 60"
@@ -799,7 +823,7 @@ def make_post_zips(date_dir, groups, cfg):
         zname = ("post%d.zip" % idx) if multi else "post.zip"
         rname = ("registry_%d.xlsx" % idx) if multi else "registry.xlsx"
         registry_path = os.path.join(date_dir, rname)
-        n_rows = build_registry_xlsx(template, registry_path, chunk, sender_address)
+        n_rows = build_registry_xlsx(registry_path, chunk, sender_address)
         print("  РЕЕСТР под %s: %d строк" % (zname, n_rows))
         zip_path = os.path.join(date_dir, zname)
         if os.path.exists(zip_path):
@@ -948,7 +972,7 @@ def stage_post(date_dir, cfg):
             base = re.sub(r"[\\/:*?\"<>|]+", "_", label).strip(" ._")
             if g["inn"]:
                 base += "_ИНН" + g["inn"]
-        base = re.sub(r"\s+", " ", base)[:230].strip(" .")
+        base = re.sub(r"\s+", " ", base)[:46].strip(" .")   # FILE_NAME: имя вместе с .pdf <= 50 зн.
         zname = base + ".pdf"
         k = 1
         while zname.lower() in used:
@@ -978,10 +1002,7 @@ def stage_post(date_dir, cfg):
 
 
 def main():
-    flags = [a for a in sys.argv[1:] if a.startswith("--")]
-    pos = [a for a in sys.argv[1:] if not a.startswith("--")]
-    post_only = "--post-only" in flags
-    no_post = "--no-post" in flags
+    pos = [a for a in sys.argv[1:]]
     cfg = load_config()
     d = ask_date(pos[0] if pos else None)
     date_ddmmyyyy = d.strftime("%d.%m.%Y")
@@ -989,12 +1010,9 @@ def main():
     date_dir = os.path.join(OUT_ROOT, date_ddmmyyyy)
     print("Дата утверждения: %s (каталог: %s)" % (date_ddmmyyyy, date_dir))
 
-    rc = 0
-    if not post_only:
-        rc = do_download(cfg, d, date_iso, date_ddmmyyyy)
-    if not no_post:
-        stage_post(date_dir, cfg)
-        cleanup_date_dir(date_dir)
+    rc = do_download(cfg, d, date_iso, date_ddmmyyyy)
+    stage_post(date_dir, cfg)
+    cleanup_date_dir(date_dir)
     return rc
 
 
